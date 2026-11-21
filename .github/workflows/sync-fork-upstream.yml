@@ -1,0 +1,103 @@
+name: Daily Safe Upstream Sync
+on:
+  schedule:
+    - cron: "45 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-safe-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out this fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Merge original repository updates safely
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          metadata="$(curl --fail --silent --show-error --retry 3 \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${REPOSITORY}")"
+
+          parent="$(jq -r '.parent.full_name // empty' <<< "${metadata}")"
+          parent_branch="$(jq -r '.parent.default_branch // empty' <<< "${metadata}")"
+
+          if [[ -z "${parent}" || -z "${parent_branch}" ]]; then
+            echo "No available upstream repository. Your fork has been left intact." >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${parent}.git"
+          git fetch --no-tags upstream "refs/heads/${parent_branch}:refs/remotes/upstream/auto-sync"
+
+          if git merge-base --is-ancestor refs/remotes/upstream/auto-sync HEAD; then
+            echo "Already current with ${parent} (${parent_branch})." >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          # GitHub's built-in GITHUB_TOKEN cannot update .github/workflows files.
+          # Merge new upstream code, but keep our existing workflow definitions.
+          # Resolve ONLY conflicts in GitHub workflow definitions, always keeping
+          # this fork's version. All other merge conflicts remain hard failures.
+          if ! git merge --no-commit --no-ff refs/remotes/upstream/auto-sync; then
+            mapfile -d '' -t conflicts < <(git diff --name-only --diff-filter=U -z)
+            if (( ${#conflicts[@]} == 0 )); then
+              git merge --abort || true
+              echo "Merge failed without conflict paths; no changes pushed." >> "${GITHUB_STEP_SUMMARY}"
+              exit 1
+            fi
+            for path in "${conflicts[@]}"; do
+              case "${path}" in
+                .github/workflows/*) ;;
+                *)
+                  git merge --abort || true
+                  echo "Manual review required for source conflict: ${path}" >> "${GITHUB_STEP_SUMMARY}"
+                  exit 1
+                  ;;
+              esac
+            done
+            for path in "${conflicts[@]}"; do
+              if git cat-file -e "HEAD:${path}" 2>/dev/null; then
+                git restore --source=HEAD --staged --worktree -- "${path}"
+              else
+                git rm -f -- "${path}"
+              fi
+            done
+            echo "Resolved workflow-only merge conflicts using fork versions." >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+          # Preserve every workflow exactly as it exists in this fork.
+          # This also removes upstream-added workflow files from the merge index.
+          workflow_changes="$(git diff --cached --name-only -- .github/workflows | wc -l)"
+          git restore --source=HEAD --staged --worktree -- .github/workflows
+          if (( workflow_changes > 0 )); then
+            echo "Skipped ${workflow_changes} upstream workflow changes, preserving fork definitions." >> "${GITHUB_STEP_SUMMARY}"
+          fi
+          if [[ -n "$(git diff --name-only --diff-filter=U)" ]]; then
+            git merge --abort || true
+            echo "Unresolved merge entries remain; no changes pushed." >> "${GITHUB_STEP_SUMMARY}"
+            exit 1
+          fi
+
+          git commit -m "chore(sync): merge upstream changes"
+          git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
+          echo "Updated from ${parent} (${parent_branch}) without overwriting existing commits or GitHub workflow files." >> "${GITHUB_STEP_SUMMARY}"
